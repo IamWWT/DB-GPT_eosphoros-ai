@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import List, Optional
 
 from dbgpt._private.pydantic import BaseModel, ConfigDict
@@ -15,14 +16,22 @@ class KnowledgeSpaceRequest(BaseModel):
     """name: knowledge space name"""
 
     """vector_type: vector type"""
-    id: int = None
+    id: Optional[int] = None
     name: str = None
     """vector_type: vector type"""
     vector_type: str = None
+    """vector_type: vector type"""
+    domain_type: str = "Normal"
     """desc: description"""
     desc: str = None
     """owner: owner"""
     owner: str = None
+
+
+class BusinessFieldType(Enum):
+    """BusinessFieldType"""
+
+    NORMAL = "Normal"
 
 
 class KnowledgeDocumentRequest(BaseModel):
@@ -51,6 +60,10 @@ class DocumentQueryRequest(BaseModel):
     page: int = 1
     """page_size: page size"""
     page_size: int = 20
+
+
+class GraphVisRequest(BaseModel):
+    limit: int = 100
 
 
 class DocumentSyncRequest(BaseModel):

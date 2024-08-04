@@ -257,13 +257,6 @@ class BaseChat(ABC):
     def stream_call_reinforce_fn(self, text):
         return text
 
-    async def check_iterator_end(iterator):
-        try:
-            await asyncio.anext(iterator)
-            return False  # 迭代器还有下一个元素
-        except StopAsyncIteration:
-            return True  # 迭代器已经执行结束
-
     def _get_span_metadata(self, payload: Dict) -> Dict:
         metadata = {k: v for k, v in payload.items()}
         del metadata["prompt"]
@@ -338,7 +331,7 @@ class BaseChat(ABC):
 
     @async_retry(
         retries=CFG.DBGPT_APP_SCENE_NON_STREAMING_RETRIES_BASE,
-        parallel_executions=CFG.DBGPT_APP_SCENE_NON_STREAMING_RETRIES_BASE,
+        parallel_executions=CFG.DBGPT_APP_SCENE_NON_STREAMING_PARALLELISM_BASE,
         catch_exceptions=(Exception, BaseAppException),
     )
     async def _no_streaming_call_with_retry(self, payload):

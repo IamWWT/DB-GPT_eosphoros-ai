@@ -2,6 +2,8 @@
 
 from typing import Any, Dict
 
+from dbgpt.rag.knowledge.factory import KnowledgeFactory
+
 _MODULE_CACHE: Dict[str, Any] = {}
 
 
@@ -27,6 +29,7 @@ def __getattr__(name: str):
         "StringKnowledge": "string",
         "TXTKnowledge": "txt",
         "URLKnowledge": "url",
+        "ExcelKnowledge": "xlsx",
     }
 
     if name in _LIBS:
@@ -53,4 +56,5 @@ __all__ = [
     "StringKnowledge",
     "TXTKnowledge",
     "URLKnowledge",
+    "ExcelKnowledge",
 ]

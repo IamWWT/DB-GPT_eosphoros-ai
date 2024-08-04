@@ -3,13 +3,14 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, TypeVar, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, cast
 
 import schedule
 import tomlkit
 
 from dbgpt._private.pydantic import BaseModel, ConfigDict, Field, model_validator
 from dbgpt.component import BaseComponent, SystemApp
+from dbgpt.core.awel import DAG
 from dbgpt.core.awel.flow.flow_factory import FlowPanel
 from dbgpt.util.dbgpts.base import (
     DBGPTS_METADATA_FILE,
@@ -73,8 +74,11 @@ class BasePackage(BaseModel):
 
     @classmethod
     def load_module_class(
-        cls, values: Dict[str, Any], expected_cls: Type[T]
-    ) -> List[Type[T]]:
+        cls,
+        values: Dict[str, Any],
+        expected_cls: Type[T],
+        predicates: Optional[List[Callable[..., bool]]] = None,
+    ) -> Tuple[List[Type[T]], List[Any], List[Any]]:
         import importlib.resources as pkg_resources
 
         from dbgpt.core.awel.dag.loader import _load_modules_from_file
@@ -90,12 +94,15 @@ class BasePackage(BaseModel):
         with pkg_resources.path(name, "__init__.py") as path:
             mods = _load_modules_from_file(str(path), name, show_log=False)
             all_cls = [_get_classes_from_module(m) for m in mods]
+            all_predicate_results = []
+            for m in mods:
+                all_predicate_results.extend(_get_from_module(m, predicates))
             module_cls = []
             for list_cls in all_cls:
                 for c in list_cls:
                     if issubclass(c, expected_cls):
                         module_cls.append(c)
-            return module_cls
+            return module_cls, all_predicate_results, mods
 
 
 class FlowPackage(BasePackage):
@@ -107,6 +114,24 @@ class FlowPackage(BasePackage):
     ) -> "FlowPackage":
         if values["definition_type"] == "json":
             return FlowJsonPackage.build_from(values, ext_dict)
+        return FlowPythonPackage.build_from(values, ext_dict)
+
+
+class FlowPythonPackage(FlowPackage):
+    dag: DAG = Field(..., description="The DAG of the package")
+
+    @classmethod
+    def build_from(cls, values: Dict[str, Any], ext_dict: Dict[str, Any]):
+        from dbgpt.core.awel.dag.loader import _process_modules
+
+        _, _, mods = cls.load_module_class(values, DAG)
+
+        dags = _process_modules(mods, show_log=False)
+        if not dags:
+            raise ValueError("No DAGs found in the package")
+        if len(dags) > 1:
+            raise ValueError("Only support one DAG in the package")
+        values["dag"] = dags[0]
         return cls(**values)
 
 
@@ -138,7 +163,7 @@ class OperatorPackage(BasePackage):
     def build_from(cls, values: Dict[str, Any], ext_dict: Dict[str, Any]):
         from dbgpt.core.awel import BaseOperator
 
-        values["operators"] = cls.load_module_class(values, BaseOperator)
+        values["operators"], _, _ = cls.load_module_class(values, BaseOperator)
         return cls(**values)
 
 
@@ -153,7 +178,47 @@ class AgentPackage(BasePackage):
     def build_from(cls, values: Dict[str, Any], ext_dict: Dict[str, Any]):
         from dbgpt.agent import ConversableAgent
 
-        values["agents"] = cls.load_module_class(values, ConversableAgent)
+        values["agents"], _, _ = cls.load_module_class(values, ConversableAgent)
+        return cls(**values)
+
+
+class ResourcePackage(BasePackage):
+    package_type: str = "resource"
+
+    resources: List[type] = Field(
+        default_factory=list, description="The resources of the package"
+    )
+    resource_instances: List[Any] = Field(
+        default_factory=list, description="The resource instances of the package"
+    )
+
+    @classmethod
+    def build_from(cls, values: Dict[str, Any], ext_dict: Dict[str, Any]):
+        from dbgpt.agent.resource import Resource
+        from dbgpt.agent.resource.tool.pack import _is_function_tool
+
+        def _predicate(obj):
+            if not obj:
+                return False
+            elif _is_function_tool(obj):
+                return True
+            elif isinstance(obj, Resource):
+                return True
+            elif isinstance(obj, type) and issubclass(obj, Resource):
+                return True
+            else:
+                return False
+
+        _, predicted_cls, _ = cls.load_module_class(values, Resource, [_predicate])
+        resource_instances = []
+        resources = []
+        for o in predicted_cls:
+            if _is_function_tool(o) or isinstance(o, Resource):
+                resource_instances.append(o)
+            elif isinstance(o, type) and issubclass(o, Resource):
+                resources.append(o)
+        values["resource_instances"] = resource_instances
+        values["resources"] = resources
         return cls(**values)
 
 
@@ -173,6 +238,17 @@ def _get_classes_from_module(module):
     return classes
 
 
+def _get_from_module(module, predicates: Optional[List[str]] = None):
+    if not predicates:
+        return []
+    results = []
+    for predicate in predicates:
+        for name, obj in inspect.getmembers(module, predicate):
+            if obj.__module__ == module.__name__:
+                results.append(obj)
+    return results
+
+
 def _parse_package_metadata(package: InstalledPackage) -> BasePackage:
     with open(
         Path(package.root) / DBGPTS_METADATA_FILE, mode="r+", encoding="utf-8"
@@ -190,6 +266,9 @@ def _parse_package_metadata(package: InstalledPackage) -> BasePackage:
         elif key == "agent":
             pkg_dict = {k: v for k, v in value.items()}
             pkg_dict["package_type"] = "agent"
+        elif key == "resource":
+            pkg_dict = {k: v for k, v in value.items()}
+            pkg_dict["package_type"] = "resource"
         else:
             ext_metadata[key] = value
     pkg_dict["root"] = package.root
@@ -201,6 +280,8 @@ def _parse_package_metadata(package: InstalledPackage) -> BasePackage:
         return OperatorPackage.build_from(pkg_dict, ext_metadata)
     elif pkg_dict["package_type"] == "agent":
         return AgentPackage.build_from(pkg_dict, ext_metadata)
+    elif pkg_dict["package_type"] == "resource":
+        return ResourcePackage.build_from(pkg_dict, ext_metadata)
     else:
         raise ValueError(
             f"Unsupported package package_type: {pkg_dict['package_type']}"
@@ -237,6 +318,51 @@ def _load_package_from_path(path: str):
     for package in packages:
         parsed_packages.append(_parse_package_metadata(package))
     return parsed_packages
+
+
+def _load_flow_package_from_path(name: str, path: str = INSTALL_DIR) -> FlowPackage:
+    raw_packages = _load_installed_package(path)
+    new_name = name.replace("_", "-")
+    packages = [p for p in raw_packages if p.package == name or p.name == name]
+    if not packages:
+        packages = [
+            p for p in raw_packages if p.package == new_name or p.name == new_name
+        ]
+    if not packages:
+        raise ValueError(f"Can't find the package {name} or {new_name}")
+    flow_package = _parse_package_metadata(packages[0])
+    if flow_package.package_type != "flow":
+        raise ValueError(f"Unsupported package type: {flow_package.package_type}")
+    return cast(FlowPackage, flow_package)
+
+
+def _flow_package_to_flow_panel(package: FlowPackage) -> FlowPanel:
+    dict_value = {
+        "name": package.name,
+        "label": package.label,
+        "version": package.version,
+        "editable": False,
+        "description": package.description,
+        "source": package.repo,
+        "define_type": "json",
+    }
+    if isinstance(package, FlowJsonPackage):
+        dict_value["flow_data"] = package.read_definition_json()
+    elif isinstance(package, FlowPythonPackage):
+        dict_value["flow_data"] = {
+            "nodes": [],
+            "edges": [],
+            "viewport": {
+                "x": 213,
+                "y": 269,
+                "zoom": 0,
+            },
+        }
+        dict_value["flow_dag"] = package.dag
+        dict_value["define_type"] = "python"
+    else:
+        raise ValueError(f"Unsupported package type: {package}")
+    return FlowPanel(**dict_value)
 
 
 class DBGPTsLoader(BaseComponent):
@@ -291,17 +417,9 @@ class DBGPTsLoader(BaseComponent):
         for package in self._packages.values():
             if package.package_type != "flow":
                 continue
-            package = cast(FlowJsonPackage, package)
-            dict_value = {
-                "name": package.name,
-                "label": package.label,
-                "version": package.version,
-                "editable": False,
-                "description": package.description,
-                "source": package.repo,
-                "flow_data": package.read_definition_json(),
-            }
-            panels.append(FlowPanel(**dict_value))
+            package = cast(FlowPackage, package)
+            flow_panel = _flow_package_to_flow_panel(package)
+            panels.append(flow_panel)
         return panels
 
     def _register_packages(self, package: BasePackage):
@@ -316,3 +434,20 @@ class DBGPTsLoader(BaseComponent):
                         agent_manager.register_agent(agent_cls, ignore_duplicate=True)
                     except ValueError as e:
                         logger.warning(f"Register agent {agent_cls} error: {e}")
+        elif package.package_type == "resource":
+            from dbgpt.agent.resource import Resource
+            from dbgpt.agent.resource.manage import get_resource_manager
+
+            pkg = cast(ResourcePackage, package)
+            rm = get_resource_manager(self._system_app)
+            for inst in pkg.resource_instances:
+                try:
+                    rm.register_resource(resource_instance=inst, ignore_duplicate=True)
+                except ValueError as e:
+                    logger.warning(f"Register resource {inst} error: {e}")
+            for res in pkg.resources:
+                try:
+                    if issubclass(res, Resource):
+                        rm.register_resource(res, ignore_duplicate=True)
+                except ValueError as e:
+                    logger.warning(f"Register resource {res} error: {e}")

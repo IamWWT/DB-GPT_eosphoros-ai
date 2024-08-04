@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 from dbgpt.util.singleton import Singleton
 
 if TYPE_CHECKING:
-    from auto_gpt_plugin_template import AutoGPTPluginTemplate
-
-    from dbgpt.agent.plugin import CommandRegistry
     from dbgpt.component import SystemApp
     from dbgpt.datasource.manages import ConnectorManager
 
@@ -165,41 +162,14 @@ class Config(metaclass=Singleton):
         from dbgpt.core._private.prompt_registry import PromptTemplateRegistry
 
         self.prompt_template_registry = PromptTemplateRegistry()
-        ### Related configuration of built-in commands
-        self.command_registry: Optional[CommandRegistry] = None
-
-        disabled_command_categories = os.getenv("DISABLED_COMMAND_CATEGORIES")
-        if disabled_command_categories:
-            self.disabled_command_categories = disabled_command_categories.split(",")
-        else:
-            self.disabled_command_categories = []
 
         self.execute_local_commands = (
             os.getenv("EXECUTE_LOCAL_COMMANDS", "False").lower() == "true"
         )
-        ### message stor file
+        # message stor file
         self.message_dir = os.getenv("MESSAGE_HISTORY_DIR", "../../message")
 
-        ### The associated configuration parameters of the plug-in control the loading and use of the plug-in
-
-        self.plugins: List["AutoGPTPluginTemplate"] = []
-        self.plugins_openai = []  # type: ignore
-        self.plugins_auto_load = os.getenv("AUTO_LOAD_PLUGIN", "True").lower() == "true"
-
-        self.plugins_git_branch = os.getenv("PLUGINS_GIT_BRANCH", "plugin_dashboard")
-
-        plugins_allowlist = os.getenv("ALLOWLISTED_PLUGINS")
-        if plugins_allowlist:
-            self.plugins_allowlist = plugins_allowlist.split(",")
-        else:
-            self.plugins_allowlist = []
-
-        plugins_denylist = os.getenv("DENYLISTED_PLUGINS")
-        if plugins_denylist:
-            self.plugins_denylist = plugins_denylist.split(",")
-        else:
-            self.plugins_denylist = []
-        ### Native SQL Execution Capability Control Configuration
+        # Native SQL Execution Capability Control Configuration
         self.NATIVE_SQL_CAN_RUN_DDL = (
             os.getenv("NATIVE_SQL_CAN_RUN_DDL", "True").lower() == "true"
         )
@@ -207,7 +177,7 @@ class Config(metaclass=Singleton):
             os.getenv("NATIVE_SQL_CAN_RUN_WRITE", "True").lower() == "true"
         )
 
-        ### dbgpt meta info database connection configuration
+        # dbgpt meta info database connection configuration
         self.LOCAL_DB_HOST = os.getenv("LOCAL_DB_HOST")
         self.LOCAL_DB_PATH = os.getenv("LOCAL_DB_PATH", "data/default_sqlite.db")
         self.LOCAL_DB_TYPE = os.getenv("LOCAL_DB_TYPE", "sqlite")
@@ -223,13 +193,13 @@ class Config(metaclass=Singleton):
 
         self.CHAT_HISTORY_STORE_TYPE = os.getenv("CHAT_HISTORY_STORE_TYPE", "db")
 
-        ### LLM Model Service Configuration
-        self.LLM_MODEL = os.getenv("LLM_MODEL", "vicuna-13b-v1.5")
+        # LLM Model Service Configuration
+        self.LLM_MODEL = os.getenv("LLM_MODEL", "glm-4-9b-chat")
         self.LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH")
 
-        ### Proxy llm backend, this configuration is only valid when "LLM_MODEL=proxyllm"
-        ### When we use the rest API provided by deployment frameworks like fastchat as a proxyllm, "PROXYLLM_BACKEND" is the model they actually deploy.
-        ### We need to use "PROXYLLM_BACKEND" to load the prompt of the corresponding scene.
+        # Proxy llm backend, this configuration is only valid when "LLM_MODEL=proxyllm"
+        # When we use the rest API provided by deployment frameworks like fastchat as a proxyllm, "PROXYLLM_BACKEND" is the model they actually deploy.
+        # We need to use "PROXYLLM_BACKEND" to load the prompt of the corresponding scene.
         self.PROXYLLM_BACKEND = None
         if self.LLM_MODEL == "proxyllm":
             self.PROXYLLM_BACKEND = os.getenv("PROXYLLM_BACKEND")
@@ -241,7 +211,7 @@ class Config(metaclass=Singleton):
             "MODEL_SERVER", "http://127.0.0.1" + ":" + str(self.MODEL_PORT)
         )
 
-        ### Vector Store Configuration
+        # Vector Store Configuration
         self.VECTOR_STORE_TYPE = os.getenv("VECTOR_STORE_TYPE", "Chroma")
         self.MILVUS_URL = os.getenv("MILVUS_URL", "127.0.0.1")
         self.MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
@@ -253,7 +223,7 @@ class Config(metaclass=Singleton):
         self.ELASTICSEARCH_USERNAME = os.getenv("ELASTICSEARCH_USERNAME", None)
         self.ELASTICSEARCH_PASSWORD = os.getenv("ELASTICSEARCH_PASSWORD", None)
 
-        ## OceanBase Configuration
+        # OceanBase Configuration
         self.OB_HOST = os.getenv("OB_HOST", "127.0.0.1")
         self.OB_PORT = int(os.getenv("OB_PORT", "2881"))
         self.OB_USER = os.getenv("OB_USER", "root")
@@ -275,11 +245,18 @@ class Config(metaclass=Singleton):
         os.environ["load_8bit"] = str(self.IS_LOAD_8BIT)
         os.environ["load_4bit"] = str(self.IS_LOAD_4BIT)
 
-        ### EMBEDDING Configuration
+        # EMBEDDING Configuration
         self.EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text2vec")
+        # Rerank model configuration
+        self.RERANK_MODEL = os.getenv("RERANK_MODEL")
+        self.RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH")
+        self.RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", 3))
         self.KNOWLEDGE_CHUNK_SIZE = int(os.getenv("KNOWLEDGE_CHUNK_SIZE", 100))
         self.KNOWLEDGE_CHUNK_OVERLAP = int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", 50))
         self.KNOWLEDGE_SEARCH_TOP_SIZE = int(os.getenv("KNOWLEDGE_SEARCH_TOP_SIZE", 5))
+        self.KNOWLEDGE_GRAPH_SEARCH_TOP_SIZE = int(
+            os.getenv("KNOWLEDGE_GRAPH_SEARCH_TOP_SIZE", 50)
+        )
         self.KNOWLEDGE_MAX_CHUNKS_ONCE_LOAD = int(
             os.getenv("KNOWLEDGE_MAX_CHUNKS_ONCE_LOAD", 10)
         )
@@ -299,17 +276,17 @@ class Config(metaclass=Singleton):
             os.getenv("KNOWLEDGE_CHAT_SHOW_RELATIONS", "False").lower() == "true"
         )
 
-        ### SUMMARY_CONFIG Configuration
+        # SUMMARY_CONFIG Configuration
         self.SUMMARY_CONFIG = os.getenv("SUMMARY_CONFIG", "FAST")
 
         self.MAX_GPU_MEMORY = os.getenv("MAX_GPU_MEMORY", None)
 
-        ### Log level
+        # Log level
         self.DBGPT_LOG_LEVEL = os.getenv("DBGPT_LOG_LEVEL", "INFO")
 
         self.SYSTEM_APP: Optional["SystemApp"] = None
 
-        ### Temporary configuration
+        # Temporary configuration
         self.USE_FASTCHAT: bool = os.getenv("USE_FASTCHAT", "True").lower() == "true"
 
         self.MODEL_CACHE_ENABLE: bool = (
@@ -335,6 +312,8 @@ class Config(metaclass=Singleton):
         self.DBGPT_APP_SCENE_NON_STREAMING_PARALLELISM_BASE = int(
             os.getenv("DBGPT_APP_SCENE_NON_STREAMING_PARALLELISM_BASE", 1)
         )
+        # experimental financial report model configuration
+        self.FIN_REPORT_MODEL = os.getenv("FIN_REPORT_MODEL", None)
 
     @property
     def local_db_manager(self) -> "ConnectorManager":

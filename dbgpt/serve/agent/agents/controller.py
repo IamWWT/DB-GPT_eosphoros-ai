@@ -17,7 +17,8 @@ from dbgpt.agent.core.memory.gpts.gpts_memory import GptsMemory
 from dbgpt.agent.core.plan import AutoPlanChatManager, DefaultAWELLayoutManager
 from dbgpt.agent.core.schema import Status
 from dbgpt.agent.core.user_proxy_agent import UserProxyAgent
-from dbgpt.agent.resource.resource_loader import ResourceLoader
+from dbgpt.agent.resource.base import Resource
+from dbgpt.agent.resource.manage import get_resource_manager
 from dbgpt.agent.util.llm.llm import LLMConfig, LLMStrategyType
 from dbgpt.app.openapi.api_view_model import Result
 from dbgpt.app.scene.base import ChatScene
@@ -28,13 +29,11 @@ from dbgpt.model.cluster.client import DefaultLLMClient
 from dbgpt.serve.agent.model import PagenationFilter, PluginHubFilter
 from dbgpt.serve.conversation.serve import Serve as ConversationServe
 from dbgpt.util.json_utils import serialize
+from dbgpt.util.tracer import root_tracer
 
 from ..db.gpts_app import GptsApp, GptsAppDao, GptsAppQuery
 from ..db.gpts_conversations_db import GptsConversationsDao, GptsConversationsEntity
 from ..db.gpts_manage_db import GptsInstanceEntity
-from ..resource_loader.datasource_load_client import DatasourceLoadClient
-from ..resource_loader.knowledge_space_load_client import KnowledgeSpaceLoadClient
-from ..resource_loader.plugin_hub_load_client import PluginHubLoadClient
 from ..team.base import TeamMode
 from .db_gpts_memory import MetaDbGptsMessageMemory, MetaDbGptsPlansMemory
 
@@ -93,8 +92,6 @@ class MultiAgents(BaseComponent, ABC):
         from dbgpt.agent.core.memory.hybrid import HybridMemory
         from dbgpt.configs.model_config import EMBEDDING_MODEL_CONFIG
         from dbgpt.rag.embedding.embedding_factory import EmbeddingFactory
-        from dbgpt.storage.vector_store.base import VectorStoreConfig
-        from dbgpt.storage.vector_store.connector import VectorStoreConnector
 
         memory_key = f"{dbgpts_name}_{conv_id}"
         if memory_key in self.agent_memory_map:
@@ -105,13 +102,17 @@ class MultiAgents(BaseComponent, ABC):
             model_name=EMBEDDING_MODEL_CONFIG[CFG.EMBEDDING_MODEL]
         )
         vstore_name = f"_chroma_agent_memory_{dbgpts_name}_{conv_id}"
-        vector_store_connector = VectorStoreConnector(
-            vector_store_type=CFG.VECTOR_STORE_TYPE,
-            vector_store_config=VectorStoreConfig(
-                name=vstore_name, embedding_fn=embedding_fn
-            ),
+        # Just use chroma store now
+        # vector_store_connector = VectorStoreConnector(
+        #     vector_store_type=CFG.VECTOR_STORE_TYPE,
+        #     vector_store_config=VectorStoreConfig(
+        #         name=vstore_name, embedding_fn=embedding_fn
+        #     ),
+        # )
+        memory = HybridMemory[AgentMemoryFragment].from_chroma(
+            vstore_name=vstore_name,
+            embeddings=embedding_fn,
         )
-        memory = HybridMemory[AgentMemoryFragment].from_vstore(vector_store_connector)
         agent_memory = AgentMemory(memory, gpts_memory=self.memory)
         self.agent_memory_map[memory_key] = agent_memory
         return agent_memory
@@ -158,7 +159,12 @@ class MultiAgents(BaseComponent, ABC):
 
         task = asyncio.create_task(
             multi_agents.agent_team_chat_new(
-                user_query, agent_conv_id, gpt_app, is_retry_chat, agent_memory
+                user_query,
+                agent_conv_id,
+                gpt_app,
+                is_retry_chat,
+                agent_memory,
+                span_id=root_tracer.get_current_span_id(),
             )
         )
 
@@ -241,16 +247,10 @@ class MultiAgents(BaseComponent, ABC):
         gpts_app: GptsApp,
         is_retry_chat: bool = False,
         agent_memory: Optional[AgentMemory] = None,
+        span_id: Optional[str] = None,
     ):
         employees: List[Agent] = []
-        # Prepare resource loader
-        resource_loader = ResourceLoader()
-        plugin_hub_loader = PluginHubLoadClient()
-        resource_loader.register_resource_api(plugin_hub_loader)
-        datasource_loader = DatasourceLoadClient()
-        resource_loader.register_resource_api(datasource_loader)
-        knowledge_space_loader = KnowledgeSpaceLoadClient()
-        resource_loader.register_resource_api(knowledge_space_loader)
+        rm = get_resource_manager()
         context: AgentContext = AgentContext(
             conv_id=conv_uid,
             gpts_app_name=gpts_app.app_name,
@@ -264,6 +264,7 @@ class MultiAgents(BaseComponent, ABC):
         ).create()
         self.llm_provider = DefaultLLMClient(worker_manager, auto_convert_message=True)
 
+        depend_resource: Optional[Resource] = None
         for record in gpts_app.details:
             cls: Type[ConversableAgent] = get_agent_manager().get_by_name(
                 record.agent_name
@@ -273,12 +274,13 @@ class MultiAgents(BaseComponent, ABC):
                 llm_strategy=LLMStrategyType(record.llm_strategy),
                 strategy_context=record.llm_strategy_value,
             )
+            depend_resource = rm.build_resource(record.resources, version="v1")
+
             agent = (
                 await cls()
                 .bind(context)
                 .bind(llm_config)
-                .bind(record.resources)
-                .bind(resource_loader)
+                .bind(depend_resource)
                 .bind(agent_memory)
                 .build()
             )
@@ -296,31 +298,26 @@ class MultiAgents(BaseComponent, ABC):
             else:
                 raise ValueError(f"Unknown Agent Team Mode!{team_mode}")
             manager = (
-                await manager.bind(context)
-                .bind(llm_config)
-                .bind(resource_loader)
-                .bind(agent_memory)
-                .build()
+                await manager.bind(context).bind(llm_config).bind(agent_memory).build()
             )
             manager.hire(employees)
             recipient = manager
 
         user_proxy: UserProxyAgent = (
-            await UserProxyAgent()
-            .bind(context)
-            .bind(resource_loader)
-            .bind(agent_memory)
-            .build()
+            await UserProxyAgent().bind(context).bind(agent_memory).build()
         )
         if is_retry_chat:
             # retry chat
             self.gpts_conversations.update(conv_uid, Status.RUNNING.value)
 
         try:
-            await user_proxy.initiate_chat(
-                recipient=recipient,
-                message=user_query,
-            )
+            with root_tracer.start_span(
+                "dbgpt.serve.agent.run_agent", parent_span_id=span_id
+            ):
+                await user_proxy.initiate_chat(
+                    recipient=recipient,
+                    message=user_query,
+                )
         except Exception as e:
             logger.error(f"chat abnormal termination！{str(e)}", e)
             self.gpts_conversations.update(conv_uid, Status.FAILED.value)

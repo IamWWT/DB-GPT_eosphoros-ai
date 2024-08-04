@@ -827,11 +827,17 @@ async def api_model_shutdown(request: WorkerStartupRequest):
 
 
 def _setup_fastapi(
-    worker_params: ModelWorkerParameters, app=None, ignore_exception: bool = False
+    worker_params: ModelWorkerParameters,
+    app=None,
+    ignore_exception: bool = False,
+    system_app: Optional[SystemApp] = None,
 ):
     if not app:
         app = create_app()
         setup_http_service_logging()
+
+        if system_app:
+            system_app._asgi_app = app
 
     if worker_params.standalone:
         from dbgpt.model.cluster.controller.controller import initialize_controller
@@ -848,7 +854,7 @@ def _setup_fastapi(
         logger.info(
             f"Run WorkerManager with standalone mode, controller_addr: {worker_params.controller_addr}"
         )
-        initialize_controller(app=app)
+        initialize_controller(app=app, system_app=system_app)
         app.include_router(controller_router, prefix="/api")
 
     async def startup_event():
@@ -952,7 +958,10 @@ def _create_local_model_manager(
         )
 
 
-def _build_worker(worker_params: ModelWorkerParameters):
+def _build_worker(
+    worker_params: ModelWorkerParameters,
+    ext_worker_kwargs: Optional[Dict[str, Any]] = None,
+):
     worker_class = worker_params.worker_class
     if worker_class:
         from dbgpt.util.module_utils import import_from_checked_string
@@ -976,11 +985,16 @@ def _build_worker(worker_params: ModelWorkerParameters):
         else:
             raise Exception("Unsupported worker type: {worker_params.worker_type}")
 
-    return worker_cls()
+    if ext_worker_kwargs:
+        return worker_cls(**ext_worker_kwargs)
+    else:
+        return worker_cls()
 
 
 def _start_local_worker(
-    worker_manager: WorkerManagerAdapter, worker_params: ModelWorkerParameters
+    worker_manager: WorkerManagerAdapter,
+    worker_params: ModelWorkerParameters,
+    ext_worker_kwargs: Optional[Dict[str, Any]] = None,
 ):
     with root_tracer.start_span(
         "WorkerManager._start_local_worker",
@@ -991,7 +1005,7 @@ def _start_local_worker(
             "sys_infos": _get_dict_from_obj(get_system_info()),
         },
     ):
-        worker = _build_worker(worker_params)
+        worker = _build_worker(worker_params, ext_worker_kwargs=ext_worker_kwargs)
         if not worker_manager.worker_manager:
             worker_manager.worker_manager = _create_local_model_manager(worker_params)
         worker_manager.worker_manager.add_worker(worker, worker_params)
@@ -1001,6 +1015,7 @@ def _start_local_embedding_worker(
     worker_manager: WorkerManagerAdapter,
     embedding_model_name: str = None,
     embedding_model_path: str = None,
+    ext_worker_kwargs: Optional[Dict[str, Any]] = None,
 ):
     if not embedding_model_name or not embedding_model_path:
         return
@@ -1013,21 +1028,25 @@ def _start_local_embedding_worker(
     logger.info(
         f"Start local embedding worker with embedding parameters\n{embedding_worker_params}"
     )
-    _start_local_worker(worker_manager, embedding_worker_params)
+    _start_local_worker(
+        worker_manager, embedding_worker_params, ext_worker_kwargs=ext_worker_kwargs
+    )
 
 
 def initialize_worker_manager_in_client(
     app=None,
     include_router: bool = True,
-    model_name: str = None,
-    model_path: str = None,
+    model_name: Optional[str] = None,
+    model_path: Optional[str] = None,
     run_locally: bool = True,
-    controller_addr: str = None,
+    controller_addr: Optional[str] = None,
     local_port: int = 5670,
-    embedding_model_name: str = None,
-    embedding_model_path: str = None,
-    start_listener: Callable[["WorkerManager"], None] = None,
-    system_app: SystemApp = None,
+    embedding_model_name: Optional[str] = None,
+    embedding_model_path: Optional[str] = None,
+    rerank_model_name: Optional[str] = None,
+    rerank_model_path: Optional[str] = None,
+    start_listener: Optional[Callable[["WorkerManager"], None]] = None,
+    system_app: Optional[SystemApp] = None,
 ):
     """Initialize WorkerManager in client.
     If run_locally is True:
@@ -1046,6 +1065,10 @@ def initialize_worker_manager_in_client(
     if not app:
         raise Exception("app can't be None")
 
+    if system_app:
+        logger.info(f"Register WorkerManager {_DefaultWorkerManagerFactory.name}")
+        system_app.register(_DefaultWorkerManagerFactory, worker_manager)
+
     worker_params: ModelWorkerParameters = _parse_worker_params(
         model_name=model_name, model_path=model_path, controller_addr=controller_addr
     )
@@ -1057,11 +1080,17 @@ def initialize_worker_manager_in_client(
         worker_params.register = True
         worker_params.port = local_port
         logger.info(f"Worker params: {worker_params}")
-        _setup_fastapi(worker_params, app, ignore_exception=True)
+        _setup_fastapi(worker_params, app, ignore_exception=True, system_app=system_app)
         _start_local_worker(worker_manager, worker_params)
         worker_manager.after_start(start_listener)
         _start_local_embedding_worker(
             worker_manager, embedding_model_name, embedding_model_path
+        )
+        _start_local_embedding_worker(
+            worker_manager,
+            rerank_model_name,
+            rerank_model_path,
+            ext_worker_kwargs={"rerank_model": True},
         )
     else:
         from dbgpt.model.cluster.controller.controller import (
@@ -1072,13 +1101,14 @@ def initialize_worker_manager_in_client(
 
         if not worker_params.controller_addr:
             raise ValueError("Controller can`t be None")
-        controller_addr = worker_params.controller_addr
         logger.info(f"Worker params: {worker_params}")
         client = ModelRegistryClient(worker_params.controller_addr)
         worker_manager.worker_manager = RemoteWorkerManager(client)
         worker_manager.after_start(start_listener)
         initialize_controller(
-            app=app, remote_controller_addr=worker_params.controller_addr
+            app=app,
+            remote_controller_addr=worker_params.controller_addr,
+            system_app=system_app,
         )
         loop = asyncio.get_event_loop()
         loop.run_until_complete(worker_manager.start())
@@ -1086,8 +1116,6 @@ def initialize_worker_manager_in_client(
     if include_router and app:
         # mount WorkerManager router
         app.include_router(router, prefix="/api")
-    if system_app:
-        system_app.register(_DefaultWorkerManagerFactory, worker_manager)
 
 
 def run_worker_manager(
@@ -1120,17 +1148,22 @@ def run_worker_manager(
 
     embedded_mod = True
     logger.info(f"Worker params: {worker_params}")
+    system_app = SystemApp()
     if not app:
         # Run worker manager independently
         embedded_mod = False
-        app = _setup_fastapi(worker_params)
+        app = _setup_fastapi(worker_params, system_app=system_app)
+    system_app._asgi_app = app
 
-    system_app = SystemApp(app)
     initialize_tracer(
         os.path.join(LOGDIR, worker_params.tracer_file),
         system_app=system_app,
-        root_operation_name="DB-GPT-WorkerManager-Entry",
+        root_operation_name="DB-GPT-ModelWorker",
         tracer_storage_cls=worker_params.tracer_storage_cls,
+        enable_open_telemetry=worker_params.tracer_to_open_telemetry,
+        otlp_endpoint=worker_params.otel_exporter_otlp_traces_endpoint,
+        otlp_insecure=worker_params.otel_exporter_otlp_traces_insecure,
+        otlp_timeout=worker_params.otel_exporter_otlp_traces_timeout,
     )
 
     _start_local_worker(worker_manager, worker_params)

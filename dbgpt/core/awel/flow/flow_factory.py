@@ -6,14 +6,19 @@ from contextlib import suppress
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
 
+from typing_extensions import Annotated
+
 from dbgpt._private.pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
+    WithJsonSchema,
     field_validator,
     model_to_dict,
     model_validator,
 )
 from dbgpt.core.awel.dag.base import DAG, DAGNode
+from dbgpt.core.awel.dag.dag_manager import DAGMetadata
 
 from .base import (
     OperatorType,
@@ -255,8 +260,26 @@ class FlowCategory(str, Enum):
         raise ValueError(f"Invalid flow category value: {value}")
 
 
+_DAGModel = Annotated[
+    DAG,
+    WithJsonSchema(
+        {
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Dummy task name"}
+            },
+            "description": "DAG model, not used in the serialization.",
+        }
+    ),
+]
+
+
 class FlowPanel(BaseModel):
     """Flow panel."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True, json_encoders={DAG: lambda v: None}
+    )
 
     uid: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
@@ -277,7 +300,8 @@ class FlowPanel(BaseModel):
         description="Flow category",
         examples=[FlowCategory.COMMON, FlowCategory.CHAT_AGENT],
     )
-    flow_data: FlowData = Field(..., description="Flow data")
+    flow_data: Optional[FlowData] = Field(None, description="Flow data")
+    flow_dag: Optional[_DAGModel] = Field(None, description="Flow DAG", exclude=True)
     description: Optional[str] = Field(
         None,
         description="Flow panel description",
@@ -305,6 +329,11 @@ class FlowPanel(BaseModel):
         description="Version of the flow panel",
         examples=["0.1.0", "0.2.0"],
     )
+    define_type: Optional[str] = Field(
+        "json",
+        description="Define type of the flow panel",
+        examples=["json", "python"],
+    )
     editable: bool = Field(
         True,
         description="Whether the flow panel is editable",
@@ -323,6 +352,9 @@ class FlowPanel(BaseModel):
         None,
         description="The flow panel modified time.",
         examples=["2021-08-01 12:00:00", "2021-08-01 12:00:01", "2021-08-01 12:00:02"],
+    )
+    metadata: Optional[Union[DAGMetadata, Dict[str, Any]]] = Field(
+        default=None, description="The metadata of the flow"
     )
 
     @model_validator(mode="before")
@@ -344,7 +376,7 @@ class FlowPanel(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict."""
-        return model_to_dict(self)
+        return model_to_dict(self, exclude={"flow_dag"})
 
 
 class FlowFactory:
@@ -356,7 +388,9 @@ class FlowFactory:
 
     def build(self, flow_panel: FlowPanel) -> DAG:
         """Build the flow."""
-        flow_data = flow_panel.flow_data
+        if not flow_panel.flow_data:
+            raise ValueError("Flow data is required.")
+        flow_data = cast(FlowData, flow_panel.flow_data)
         key_to_operator_nodes: Dict[str, FlowNodeData] = {}
         key_to_resource_nodes: Dict[str, FlowNodeData] = {}
         key_to_resource: Dict[str, ResourceMetadata] = {}
@@ -525,14 +559,6 @@ class FlowFactory:
                 downstream = key_to_downstream.get(operator_key, [])
                 if not downstream:
                     raise ValueError("Branch operator should have downstream.")
-                if len(downstream) != len(view_metadata.parameters):
-                    raise ValueError(
-                        "Branch operator should have the same number of downstream as "
-                        "parameters."
-                    )
-                for i, param in enumerate(view_metadata.parameters):
-                    downstream_key, _, _ = downstream[i]
-                    param.value = key_to_operator_nodes[downstream_key].data.name
 
             try:
                 runnable_params = metadata.get_runnable_parameters(
@@ -610,7 +636,10 @@ class FlowFactory:
         """
         from dbgpt.util.module_utils import import_from_string
 
-        flow_data = flow_panel.flow_data
+        if not flow_panel.flow_data:
+            return
+
+        flow_data = cast(FlowData, flow_panel.flow_data)
         for node in flow_data.nodes:
             if node.data.is_operator:
                 node_data = cast(ViewMetadata, node.data)
@@ -709,6 +738,8 @@ def fill_flow_panel(flow_panel: FlowPanel):
     Args:
         flow_panel (FlowPanel): The flow panel to fill.
     """
+    if not flow_panel.flow_data:
+        return
     for node in flow_panel.flow_data.nodes:
         try:
             parameters_map = {}

@@ -3,16 +3,17 @@
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Type, cast
+from concurrent.futures import Executor, ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, cast
 
 from dbgpt._private.pydantic import ConfigDict, Field
 from dbgpt.core import LLMClient, ModelMessageRoleType
 from dbgpt.util.error_types import LLMChatError
+from dbgpt.util.executor_utils import blocking_func_to_async
 from dbgpt.util.tracer import SpanType, root_tracer
 from dbgpt.util.utils import colored
 
-from ..resource.resource_api import AgentResource, ResourceClient
-from ..resource.resource_loader import ResourceLoader
+from ..resource.base import Resource
 from ..util.llm.llm import LLMConfig, LLMStrategyType
 from ..util.llm.llm_client import AIWrapper
 from .action.base import Action, ActionOutput
@@ -20,6 +21,7 @@ from .agent import Agent, AgentContext, AgentMessage, AgentReviewInfo
 from .memory.agent_memory import AgentMemory
 from .memory.gpts.base import GptsMessage
 from .memory.gpts.gpts_memory import GptsMemory
+from .profile.base import ProfileConfig
 from .role import Role
 
 logger = logging.getLogger(__name__)
@@ -32,12 +34,15 @@ class ConversableAgent(Role, Agent):
 
     agent_context: Optional[AgentContext] = Field(None, description="Agent context")
     actions: List[Action] = Field(default_factory=list)
-    resources: List[AgentResource] = Field(default_factory=list)
+    resource: Optional[Resource] = Field(None, description="Resource")
     llm_config: Optional[LLMConfig] = None
-    resource_loader: Optional[ResourceLoader] = None
     max_retry_count: int = 3
     consecutive_auto_reply_counter: int = 0
     llm_client: Optional[AIWrapper] = None
+    executor: Executor = Field(
+        default_factory=lambda: ThreadPoolExecutor(max_workers=1),
+        description="Executor for running tasks",
+    )
 
     def __init__(self, **kwargs):
         """Create a new agent."""
@@ -58,27 +63,12 @@ class ConversableAgent(Role, Agent):
                 f"running!"
             )
 
-        # resource check
-        for resource in self.resources:
-            if (
-                self.resource_loader is None
-                or self.resource_loader.get_resource_api(
-                    resource.type, check_instance=False
-                )
-                is None
-            ):
-                raise ValueError(
-                    f"Resource {resource.type}:{resource.value} missing resource loader"
-                    f" implementation,unable to read resources!"
-                )
-
         # action check
         if self.actions and len(self.actions) > 0:
-            have_resource_types = [item.type for item in self.resources]
             for action in self.actions:
-                if (
-                    action.resource_need
-                    and action.resource_need not in have_resource_types
+                if action.resource_need and (
+                    not self.resource
+                    or not self.resource.get_resource_by_type(action.resource_need)
                 ):
                     raise ValueError(
                         f"{self.name}[{self.role}] Missing resources required for "
@@ -113,13 +103,6 @@ class ConversableAgent(Role, Agent):
         return self.agent_context
 
     @property
-    def not_null_resource_loader(self) -> ResourceLoader:
-        """Get the resource loader."""
-        if not self.resource_loader:
-            raise ValueError("Resource loader is not initialized！")
-        return self.resource_loader
-
-    @property
     def not_null_llm_config(self) -> LLMConfig:
         """Get the LLM config."""
         if not self.llm_config:
@@ -134,23 +117,32 @@ class ConversableAgent(Role, Agent):
             raise ValueError("LLM client is not initialized！")
         return llm_client
 
+    async def blocking_func_to_async(
+        self, func: Callable[..., Any], *args, **kwargs
+    ) -> Any:
+        """Run a potentially blocking function within an executor."""
+        if not asyncio.iscoroutinefunction(func):
+            return await blocking_func_to_async(self.executor, func, *args, **kwargs)
+        return await func(*args, **kwargs)
+
     async def preload_resource(self) -> None:
         """Preload resources before agent initialization."""
-        pass
+        if self.resource:
+            await self.blocking_func_to_async(self.resource.preload_resource)
 
     async def build(self) -> "ConversableAgent":
         """Build the agent."""
+        # Preload resources
+        await self.preload_resource()
         # Check if agent is available
         self.check_available()
         _language = self.not_null_agent_context.language
         if _language:
             self.language = _language
 
-        # Preload resources
-        await self.preload_resource()
         # Initialize resource loader
         for action in self.actions:
-            action.init_resource_loader(self.resource_loader)
+            action.init_resource(self.resource)
 
         # Initialize LLM Server
         if not self.is_human:
@@ -175,15 +167,14 @@ class ConversableAgent(Role, Agent):
             raise ValueError("GptsMemory is not supported!")
         elif isinstance(target, AgentContext):
             self.agent_context = target
-        elif isinstance(target, ResourceLoader):
-            self.resource_loader = target
-        elif isinstance(target, list) and target and len(target) > 0:
-            if _is_list_of_type(target, Action):
-                self.actions.extend(target)
-            elif _is_list_of_type(target, AgentResource):
-                self.resources = target
+        elif isinstance(target, Resource):
+            self.resource = target
         elif isinstance(target, AgentMemory):
             self.memory = target
+        elif isinstance(target, ProfileConfig):
+            self.profile = target
+        elif isinstance(target, type) and issubclass(target, Action):
+            self.actions.append(target())
         return self
 
     async def send(
@@ -201,7 +192,7 @@ class ConversableAgent(Role, Agent):
                 "sender": self.name,
                 "recipient": recipient.name,
                 "reviewer": reviewer.name if reviewer else None,
-                "agent_message": message.to_dict(),
+                "agent_message": json.dumps(message.to_dict(), ensure_ascii=False),
                 "request_reply": request_reply,
                 "is_recovery": is_recovery,
                 "conv_uid": self.not_null_agent_context.conv_id,
@@ -231,7 +222,7 @@ class ConversableAgent(Role, Agent):
                 "sender": sender.name,
                 "recipient": self.name,
                 "reviewer": reviewer.name if reviewer else None,
-                "agent_message": message.to_dict(),
+                "agent_message": json.dumps(message.to_dict(), ensure_ascii=False),
                 "request_reply": request_reply,
                 "silent": silent,
                 "is_recovery": is_recovery,
@@ -242,13 +233,26 @@ class ConversableAgent(Role, Agent):
             await self._a_process_received_message(message, sender)
             if request_reply is False or request_reply is None:
                 return
+            if self.is_human:
+                # Not generating a reply for human agents now
+                return
 
-            if not self.is_human:
+            if (
+                self.consecutive_auto_reply_counter
+                <= self.not_null_agent_context.max_chat_round
+            ):
+                # If reply count is less than the maximum chat round, generate a reply
                 reply = await self.generate_reply(
                     received_message=message, sender=sender, reviewer=reviewer
                 )
                 if reply is not None:
                     await self.send(reply, sender)
+            else:
+                logger.info(
+                    f"Current round {self.consecutive_auto_reply_counter} "
+                    f"exceeds the maximum chat round "
+                    f"{self.not_null_agent_context.max_chat_round}!"
+                )
 
     def prepare_act_param(self) -> Dict[str, Any]:
         """Prepare the parameters for the act method."""
@@ -272,7 +276,7 @@ class ConversableAgent(Role, Agent):
                 "sender": sender.name,
                 "recipient": self.name,
                 "reviewer": reviewer.name if reviewer else None,
-                "received_message": received_message.to_dict(),
+                "received_message": json.dumps(received_message.to_dict()),
                 "conv_uid": self.not_null_agent_context.conv_id,
                 "rely_messages": (
                     [msg.to_dict() for msg in rely_messages] if rely_messages else None
@@ -283,9 +287,6 @@ class ConversableAgent(Role, Agent):
         try:
             with root_tracer.start_span(
                 "agent.generate_reply._init_reply_message",
-                metadata={
-                    "received_message": received_message.to_dict(),
-                },
             ) as span:
                 # initialize reply message
                 reply_message: AgentMessage = self._init_reply_message(
@@ -320,9 +321,10 @@ class ConversableAgent(Role, Agent):
                 with root_tracer.start_span(
                     "agent.generate_reply.thinking",
                     metadata={
-                        "thinking_messages": [
-                            msg.to_dict() for msg in thinking_messages
-                        ],
+                        "thinking_messages": json.dumps(
+                            [msg.to_dict() for msg in thinking_messages],
+                            ensure_ascii=False,
+                        )
                     },
                 ) as span:
                     # 1.Think about how to do things
@@ -395,7 +397,7 @@ class ConversableAgent(Role, Agent):
                             reply_message, sender, reviewer, request_reply=False
                         )
                     fail_reason = reason
-                    await self.save_to_memory(
+                    await self.write_memories(
                         question=question,
                         ai_message=ai_message,
                         action_output=act_out,
@@ -403,7 +405,7 @@ class ConversableAgent(Role, Agent):
                         check_fail_reason=fail_reason,
                     )
                 else:
-                    await self.save_to_memory(
+                    await self.write_memories(
                         question=question,
                         ai_message=ai_message,
                         action_output=act_out,
@@ -451,6 +453,7 @@ class ConversableAgent(Role, Agent):
                     llm_model=llm_model,
                     max_new_tokens=self.not_null_agent_context.max_new_tokens,
                     temperature=self.not_null_agent_context.temperature,
+                    verbose=self.not_null_agent_context.verbose,
                 )
                 return response, llm_model
             except LLMChatError as e:
@@ -480,12 +483,12 @@ class ConversableAgent(Role, Agent):
         last_out: Optional[ActionOutput] = None
         for i, action in enumerate(self.actions):
             # Select the resources required by acton
-            need_resource = None
-            if self.resources and len(self.resources) > 0:
-                for item in self.resources:
-                    if item.type == action.resource_need:
-                        need_resource = item
-                        break
+            if action.resource_need and self.resource:
+                need_resources = self.resource.get_resource_by_type(
+                    action.resource_need
+                )
+            else:
+                need_resources = []
 
             if not message:
                 raise ValueError("The message content is empty!")
@@ -497,7 +500,7 @@ class ConversableAgent(Role, Agent):
                     "sender": sender.name if sender else None,
                     "recipient": self.name,
                     "reviewer": reviewer.name if reviewer else None,
-                    "need_resource": need_resource.to_dict() if need_resource else None,
+                    "need_resource": need_resources[0].name if need_resources else None,
                     "rely_action_out": last_out.to_dict() if last_out else None,
                     "conv_uid": self.not_null_agent_context.conv_id,
                     "action_index": i,
@@ -506,7 +509,7 @@ class ConversableAgent(Role, Agent):
             ) as span:
                 last_out = await action.run(
                     ai_message=message,
-                    resource=need_resource,
+                    resource=None,
                     rely_action_out=last_out,
                     **kwargs,
                 )
@@ -569,7 +572,9 @@ class ConversableAgent(Role, Agent):
                 "sender": self.name,
                 "recipient": recipient.name,
                 "reviewer": reviewer.name if reviewer else None,
-                "agent_message": agent_message.to_dict(),
+                "agent_message": json.dumps(
+                    agent_message.to_dict(), ensure_ascii=False
+                ),
                 "conv_uid": self.not_null_agent_context.conv_id,
             },
         ):
@@ -703,23 +708,11 @@ class ConversableAgent(Role, Agent):
         self, question: Optional[str] = None
     ) -> Dict[str, Any]:
         """Generate the resource variables."""
-        resource_prompt_list = []
-        for item in self.resources:
-            resource_client = self.not_null_resource_loader.get_resource_api(
-                item.type, ResourceClient
+        resource_prompt = None
+        if self.resource:
+            resource_prompt = await self.resource.get_prompt(
+                lang=self.language, question=question
             )
-            if not resource_client:
-                raise ValueError(
-                    f"Resource {item.type}:{item.value} missing resource loader"
-                    f" implementation,unable to read resources!"
-                )
-            resource_prompt_list.append(
-                await resource_client.get_resource_prompt(item, question)
-            )
-
-        resource_prompt = ""
-        if len(resource_prompt_list) > 0:
-            resource_prompt = "RESOURCES:" + "\n".join(resource_prompt_list)
 
         out_schema: Optional[str] = ""
         if self.actions and len(self.actions) > 0:

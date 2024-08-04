@@ -62,6 +62,7 @@ class ChromaStore(VectorStoreBase):
         Args:
             vector_store_config(ChromaVectorConfig): vector store config.
         """
+        super().__init__()
         chroma_vector_config = vector_store_config.to_dict(exclude_none=True)
         chroma_path = chroma_vector_config.get(
             "persist_path", os.path.join(PILOT_PATH, "data")
@@ -132,7 +133,7 @@ class ChromaStore(VectorStoreBase):
                 Chunk(
                     content=chroma_result[0],
                     metadata=chroma_result[1] or {},
-                    score=chroma_result[2],
+                    score=(1 - chroma_result[2]),
                 )
             )
             for chroma_result in zip(
@@ -194,7 +195,7 @@ class ChromaStore(VectorStoreBase):
         where_filters = {}
         filters_list = []
         condition = filters.condition
-        chroma_condition = f"${condition}"
+        chroma_condition = f"${condition.value}"
         if filters.filters:
             for filter in filters.filters:
                 if filter.operator:

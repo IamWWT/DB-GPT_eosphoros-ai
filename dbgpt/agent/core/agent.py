@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from dbgpt.core import LLMClient
 from dbgpt.util.annotations import PublicAPI
 
-from ..resource.resource_loader import ResourceLoader
 from .action.base import ActionOutput
 from .memory.agent_memory import AgentMemory
 
@@ -188,6 +187,7 @@ class AgentContext:
     max_new_tokens: int = 1024
     temperature: float = 0.5
     allow_format_str_template: Optional[bool] = False
+    verbose: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a dictionary representation of the AgentContext."""
@@ -209,7 +209,6 @@ class AgentGenerateContext:
 
     memory: Optional[AgentMemory] = None
     agent_context: Optional[AgentContext] = None
-    resource_loader: Optional[ResourceLoader] = None
     llm_client: Optional[LLMClient] = None
 
     round_index: Optional[int] = None
